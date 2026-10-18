@@ -1,6 +1,5 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <mbedtls/md.h>
 #include <driver/i2s.h>
 
 const char* ssid = "YOUR_WIFI_SSID";
@@ -13,25 +12,19 @@ const int PIN_MIC_DIN  = 14;
 const int PIN_AMP_DIN  = 15;
 
 const float SOUND_TRIGGER_DBFS = -10.0f;
-const int   ALARM_BURST_MS     = 500;
-const int   ALARM_BURSTS       = 3;
-const int   ALARM_FREQ_HZ      = 2000;
-
 const uint32_t SAMPLE_INTERVAL_MS = 1000;
-const int I2S_PORT = I2S_NUM_0;
+const i2s_port_t I2S_PORT = I2S_NUM_0;
 const int SAMPLE_RATE = 16000;
 
 const uint32_t WIFI_WAIT_MS = 20000;
 const uint32_t WIFI_RETRY_MS = 10000;
 uint32_t last_wifi_retry_ms = 0;
-bool wifi_uplink_ok = false;
 uint32_t last_sample_ms = 0;
 uint32_t sample_count = 0;
-bool alarm_active = false;
 
 bool initI2sRx() {
   i2s_config_t cfg = {};
-  cfg.mode = I2S_MODE_MASTER | I2S_MODE_RX;
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
   cfg.sample_rate = SAMPLE_RATE;
   cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
   cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
@@ -53,12 +46,12 @@ bool initI2sRx() {
 float readSoundDbfs() {
   static int16_t buf[2048];
   size_t nread = 0;
-  esp_err_t r = i2s_read(I2S_PORT, buf, sizeof(buf), &nread, 100 / portTICK_PERIOD_MS);
+  esp_err_t r = i2s_read(I2S_PORT, buf, sizeof(buf), &nread, pdMS_TO_TICKS(100));
   if (r != ESP_OK || nread < 256) return NAN;
   float sum = 0;
   int cnt = 0;
   for (size_t i = 0; i + 1 < nread; i += 2) {
-    int16_t s = (int16_t)(buf[i + 1] << 8 | buf[i]);
+    int16_t s = (int16_t)((buf[i + 1] << 8) | buf[i]);
     float f = s / 32768.0f;
     sum += f * f;
     cnt++;
@@ -78,7 +71,6 @@ void setupWifi() {
     delay(500);
   }
   if (WiFi.status() == WL_CONNECTED) {
-    wifi_uplink_ok = true;
     Serial.println(" connected. IP: " + WiFi.localIP().toString());
   } else {
     Serial.println(" not up yet");
@@ -93,7 +85,6 @@ void serviceWifi() {
     WiFi.begin(ssid, password);
     Serial.println("Wi-Fi: retrying...");
   }
-  wifi_uplink_ok = (WiFi.status() == WL_CONNECTED);
 }
 
 void setup() {
@@ -126,9 +117,7 @@ void loop() {
       http.addHeader("Content-Type", "application/json");
       http.setTimeout(1500);
       int code = http.POST(json_buf);
-      if (code <= 0) {
-        Serial.printf("POST failed (%d)\n", code);
-      }
+      if (code <= 0) Serial.printf("POST failed (%d)\n", code);
       http.end();
     }
   }
