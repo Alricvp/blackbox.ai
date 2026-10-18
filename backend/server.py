@@ -1,23 +1,16 @@
 """
-Landsafe AI - Backend Server
-Receives tilt + moisture data from ESP32, serves the public dashboard.
-Includes landslide prediction, weather data, and map.
+Landsafe AI - Backend Server (Dashboard Compatible)
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 import json
 import os
-import math
-import base64
-import uuid
-import urllib.request
-import urllib.parse
+import time
 
 app = FastAPI(title="Landsafe AI", version="3.0.0")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,67 +20,85 @@ app.add_middleware(
 
 sensor_data = []
 MAX_READINGS = 500
-citizen_reports = []
-MAX_REPORTS = 200
+nodes = {}  # node_id -> node state
 connected_clients: list[WebSocket] = []
 
 class TiltReading(BaseModel):
-    device_id: str
-    tilt: float
-    status: str
-    ip: str = ""
+    device_id: str = ""
+    id: str = ""
+    tilt: float = 0.0
     moisture: float = 0.0
-
-class CitizenReport(BaseModel):
-    report_type: str
-    severity: str
-    lat: float
-    lng: float
-    description: str = ""
-    reporter_name: str = "Anonymous"
-    photo_data: str = ""
+    moisture_pct: int = 0
+    status: str = "safe"
+    ip: str = ""
+    vib: float = 0.0
+    rms_vib: float = 0.0
+    sound_db: float = 0.0
+    leak: int = 0
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "readings": len(sensor_data), "reports": len(citizen_reports)}
+    return {"status": "ok", "readings": len(sensor_data), "nodes": len(nodes)}
 
 @app.post("/api/tilt")
-async def receive_tilt(reading: TiltReading):
-    entry = {
-        "device_id": reading.device_id,
-        "tilt": reading.tilt,
-        "moisture": reading.moisture,
-        "status": reading.status,
-        "ip": reading.ip,
-        "timestamp": datetime.now().isoformat(),
-    }
-    sensor_data.append(entry)
+async def receive_tilt(reading: dict):
+    rec = dict(reading)
+    device_id = rec.get("device_id") or rec.get("id") or "unknown"
+    rec["id"] = device_id
+    rec["_recv_t"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rec["time"] = time.time()
+    
+    # Map to dashboard fields
+    if "rms_vib" in rec and "vib" not in rec:
+        rec["vib"] = rec["rms_vib"]
+    if "moisture_pct" in rec and "moisture" not in rec:
+        rec["moisture"] = rec["moisture_pct"]
+    if "sound_db" in rec:
+        rec["sound"] = rec["sound_db"]
+    
+    sensor_data.append(rec)
     if len(sensor_data) > MAX_READINGS:
         sensor_data.pop(0)
-    message = json.dumps({"type": "sensor", "data": entry})
+    
+    # Build node state for dashboard
+    nodes[device_id] = {
+        "id": device_id,
+        "online": True,
+        "last_seen": rec["_recv_t"],
+        "latest": {
+            "vib": rec.get("vib", rec.get("rms_vib", 0)),
+            "freq": rec.get("freq", 0),
+            "tilt": rec.get("tilt", 0),
+            "sound": rec.get("sound", rec.get("sound_db", 0)),
+            "leak": rec.get("leak", 0) if rec.get("leak") is not None else rec.get("moisture", 0),
+        },
+        "findings": []
+    }
+    
+    # Broadcast frame in dashboard format
+    frame = {
+        "time": time.time(),
+        "nodes": nodes
+    }
+    message = json.dumps(frame)
     disconnected = []
     for client in connected_clients:
         try:
             await client.send_text(message)
         except:
             disconnected.append(client)
-    for client in disconnected:
-        connected_clients.remove(client)
-    return {"ok": True, "data": entry}
+    for c in disconnected:
+        connected_clients.remove(c)
+    
+    return {"ok": True}
 
 @app.get("/api/latest")
 async def get_latest():
-    if not sensor_data:
-        return {"data": None}
-    return {"data": sensor_data[-1]}
+    return {"ok": True, "nodes": nodes}
 
 @app.get("/api/history")
-async def get_history():
-    return {"data": sensor_data}
-
-@app.get("/api/reports")
-async def get_reports():
-    return {"data": citizen_reports}
+async def get_history(n: int = 50):
+    return {"ok": True, "count": len(sensor_data[-n:]), "data": sensor_data[-n:]}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -95,39 +106,21 @@ async def websocket_endpoint(websocket: WebSocket):
     connected_clients.append(websocket)
     try:
         while True:
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text("pong")
+            await websocket.receive_text()
     except WebSocketDisconnect:
         if websocket in connected_clients:
             connected_clients.remove(websocket)
 
-@app.get("/api/stations")
-async def get_stations():
-    stations = [
-        {"id": "ESP32-NER-001", "name": "Gangtok — 32nd Mile NH10", "state": "Sikkim", "lat": 27.18, "lng": 88.53, "score": 58.4, "level": "MODERATE", "rain": 45.2, "moisture": 70.8},
-        {"id": "ESP32-NER-002", "name": "Haflong — Jatinga Valley", "state": "Assam", "lat": 25.18, "lng": 93.02, "score": 42.1, "level": "MODERATE", "rain": 32.5, "moisture": 65.2},
-        {"id": "ESP32-NER-003", "name": "Cherrapunji — Shella Gorge", "state": "Meghalaya", "lat": 25.30, "lng": 91.70, "score": 68.7, "level": "HIGH", "rain": 78.3, "moisture": 75.6},
-    ]
-    return {"data": stations, "source": "live"}
-
-@app.get("/api/historical")
-async def get_historical():
-    return {"data": [], "summary": {"total_incidents": 0}}
-
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
     dashboard_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard", "index.html")
-    if not os.path.exists(dashboard_path):
-        dashboard_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard.html")
     try:
         with open(dashboard_path, "r") as f:
             content = f.read()
         return HTMLResponse(content=content)
     except Exception as e:
-        return HTMLResponse(content=f"<html><body><h1>Landsafe AI</h1><p>Server running</p></body></html>")
+        return HTMLResponse(content="<html><body><h1>Landsafe AI</h1></body></html>")
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
